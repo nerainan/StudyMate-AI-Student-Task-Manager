@@ -1,13 +1,19 @@
 """
-StudyMate v2 - colorful, gamified student planner
+StudyMate v3 - multi-user planner with login
 
 Run with:
     py -m pip install streamlit pandas
-    py -m streamlit run studymate_v2.py
+    py -m streamlit run studymate_v3.py
+(single file - no other files needed)
 (uses the same tasks.db as v1; old data keeps working)
 """
 
+import calendar
+import hashlib
+import hmac
 import html
+import re
+import secrets
 import sqlite3
 from contextlib import closing
 from datetime import date, datetime, timedelta
@@ -16,6 +22,7 @@ import altair as alt
 import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
+
 
 st.set_page_config(page_title="StudyMate", page_icon="🎓", layout="wide")
 
@@ -46,6 +53,306 @@ COLUMNS = ["id", "title", "subject", "deadline", "priority", "completed",
 today = date.today()
 
 
+# ================= LOGIN SYSTEM =================
+EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$")
+ITERATIONS = 200_000
+MAX_ATTEMPTS = 5
+LOCK_MINUTES = 5
+GENERIC_FAIL = "Invalid email or password."
+
+
+# ---------------- AUTH: DATABASE ----------------
+
+def _run(query, params=(), fetch=False):
+    with closing(sqlite3.connect(DB_NAME)) as conn:
+        conn.row_factory = sqlite3.Row
+        with conn:
+            cur = conn.execute(query, params)
+            if fetch:
+                return [dict(r) for r in cur.fetchall()]
+    return None
+
+
+def init_auth_tables():
+    _run("""CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        email TEXT NOT NULL UNIQUE,
+        name TEXT NOT NULL,
+        pw_hash TEXT NOT NULL, pw_salt TEXT NOT NULL,
+        rc_hash TEXT NOT NULL, rc_salt TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        failed_attempts INTEGER DEFAULT 0,
+        locked_until TEXT,
+        daily_goal REAL DEFAULT 2,
+        theme TEXT DEFAULT '🌊 Ocean')""")
+
+
+def _row_by_email(email):
+    rows = _run("SELECT * FROM users WHERE email=?", (email,), fetch=True)
+    return rows[0] if rows else None
+
+
+def _row_by_id(uid):
+    rows = _run("SELECT * FROM users WHERE id=?", (uid,), fetch=True)
+    return rows[0] if rows else None
+
+
+def _public(row):
+    return {k: row[k] for k in ("id", "email", "name", "daily_goal", "theme")}
+
+
+def get_user(uid):
+    return _public(_row_by_id(uid))
+
+
+# ---------------- HASHING & RULES ----------------
+
+def hash_secret(secret, salt_hex=None):
+    salt = bytes.fromhex(salt_hex) if salt_hex else secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac("sha256", secret.encode(), salt, ITERATIONS)
+    return digest.hex(), salt.hex()
+
+
+def verify_secret(secret, hash_hex, salt_hex):
+    digest, _ = hash_secret(secret, salt_hex)
+    return hmac.compare_digest(digest, hash_hex)
+
+
+def password_error(password):
+    if len(password) < 8:
+        return "Password must be at least 8 characters."
+    if not (re.search(r"[A-Za-z]", password) and re.search(r"\d", password)):
+        return "Password needs at least one letter and one number."
+    return None
+
+
+def new_recovery_code():
+    return "-".join(secrets.token_hex(2).upper() for _ in range(3))
+
+
+def _locked_message(row):
+    until = row["locked_until"]
+    if until and datetime.fromisoformat(until) > datetime.now():
+        secs = (datetime.fromisoformat(until) - datetime.now()).total_seconds()
+        return f"Too many failed attempts. Try again in {int(secs // 60) + 1} min."
+    return None
+
+
+def _record_failure(row):
+    attempts = row["failed_attempts"] + 1
+    if attempts >= MAX_ATTEMPTS:
+        until = (datetime.now() + timedelta(minutes=LOCK_MINUTES)).isoformat()
+        _run("UPDATE users SET failed_attempts=0, locked_until=? WHERE id=?",
+             (until, row["id"]))
+    else:
+        _run("UPDATE users SET failed_attempts=? WHERE id=?", (attempts, row["id"]))
+
+
+def _clear_failures(row):
+    _run("UPDATE users SET failed_attempts=0, locked_until=NULL WHERE id=?", (row["id"],))
+
+
+# ---------------- ACCOUNT ACTIONS ----------------
+
+def register(email, name, password):
+    """Returns (user, recovery_code) on success, or (None, error_message)."""
+    email = email.strip().lower()
+    if len(email) > 254 or not EMAIL_RE.match(email):
+        return None, "Please enter a valid email address."
+    error = password_error(password)
+    if error:
+        return None, error
+    if _row_by_email(email):
+        return None, "An account with this email already exists."
+
+    name = name.strip()[:60] or email.split("@")[0]
+    pw_hash, pw_salt = hash_secret(password)
+    code = new_recovery_code()
+    rc_hash, rc_salt = hash_secret(code)
+    first_user = not _run("SELECT 1 FROM users LIMIT 1", fetch=True)
+    try:
+        _run("INSERT INTO users (email, name, pw_hash, pw_salt, rc_hash, rc_salt, "
+             "created_at) VALUES (?,?,?,?,?,?,?)",
+             (email, name, pw_hash, pw_salt, rc_hash, rc_salt,
+              datetime.now().isoformat()))
+    except sqlite3.IntegrityError:
+        return None, "An account with this email already exists."
+
+    user = _public(_row_by_email(email))
+    if first_user:  # the first account inherits tasks created before logins existed
+        _run("UPDATE tasks SET user_id=? WHERE user_id IS NULL", (user["id"],))
+    return user, code
+
+
+def login(email, password):
+    """Returns (user, "") on success, or (None, error_message)."""
+    row = _row_by_email(email.strip().lower())
+    if not row:
+        hash_secret(password)  # keeps response time similar for unknown emails
+        return None, GENERIC_FAIL
+    locked = _locked_message(row)
+    if locked:
+        return None, locked
+    if verify_secret(password, row["pw_hash"], row["pw_salt"]):
+        _clear_failures(row)
+        return _public(row), ""
+    _record_failure(row)
+    return None, GENERIC_FAIL
+
+
+def reset_password(email, code, new_password):
+    """Returns (new_recovery_code, "") on success, or (None, error_message)."""
+    row = _row_by_email(email.strip().lower())
+    bad = "Email or recovery code is incorrect."
+    if not row:
+        hash_secret(code)
+        return None, bad
+    locked = _locked_message(row)
+    if locked:
+        return None, locked
+    error = password_error(new_password)
+    if error:
+        return None, error
+    if not verify_secret(code.strip().upper(), row["rc_hash"], row["rc_salt"]):
+        _record_failure(row)
+        return None, bad
+    pw_hash, pw_salt = hash_secret(new_password)
+    new_code = new_recovery_code()
+    rc_hash, rc_salt = hash_secret(new_code)
+    _run("UPDATE users SET pw_hash=?, pw_salt=?, rc_hash=?, rc_salt=? WHERE id=?",
+         (pw_hash, pw_salt, rc_hash, rc_salt, row["id"]))
+    _clear_failures(row)
+    return new_code, ""
+
+
+def change_password(uid, current, new):
+    row = _row_by_id(uid)
+    if not verify_secret(current, row["pw_hash"], row["pw_salt"]):
+        return False, "Current password is incorrect."
+    error = password_error(new)
+    if error:
+        return False, error
+    pw_hash, pw_salt = hash_secret(new)
+    _run("UPDATE users SET pw_hash=?, pw_salt=? WHERE id=?", (pw_hash, pw_salt, uid))
+    return True, "Password updated 🔒"
+
+
+def update_profile(uid, name, daily_goal, theme):
+    _run("UPDATE users SET name=?, daily_goal=?, theme=? WHERE id=?",
+         (name[:60], float(daily_goal), theme, uid))
+
+
+def delete_account(uid, password):
+    row = _row_by_id(uid)
+    if not verify_secret(password, row["pw_hash"], row["pw_salt"]):
+        return False, "Password is incorrect."
+    _run("DELETE FROM tasks WHERE user_id=?", (uid,))
+    _run("DELETE FROM study_logs WHERE user_id=?", (uid,))
+    _run("DELETE FROM users WHERE id=?", (uid,))
+    return True, ""
+
+
+# ---------------- STREAMLIT UI ----------------
+
+AUTH_CSS = """
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Poppins:wght@400;600;700&display=swap');
+.stApp { font-family: 'Poppins', sans-serif;
+         background: linear-gradient(135deg, #EEF2FF, #FDF2F8); }
+.authhero { background: linear-gradient(135deg, #6366F1, #EC4899); border-radius: 22px;
+            padding: 28px; text-align: center; margin-bottom: 18px;
+            box-shadow: 0 12px 30px rgba(0,0,0,.18); }
+.authhero, .authhero * { color: white !important; }
+.authhero h1 { margin: 0; }
+p, label, li { color: #334155 !important; }
+[data-testid="stFormSubmitButton"] > button, .stButton > button {
+    border-radius: 10px; border: none;
+    background: linear-gradient(135deg, #6366F1, #EC4899); }
+[data-testid="stFormSubmitButton"] > button p, .stButton > button p {
+    color: white !important; font-weight: 600; }
+</style>
+"""
+
+
+def login_screen():
+    st.markdown(AUTH_CSS, unsafe_allow_html=True)
+    _, mid, _ = st.columns([1, 2, 1])
+    with mid:
+        st.markdown('<div class="authhero"><h1>🎓 StudyMate</h1>'
+                    '<div>Plan smarter. Study better. Level up.</div></div>',
+                    unsafe_allow_html=True)
+
+        done = st.session_state.get("signup_done")
+        if done:
+            st.success("Account created! 🎉")
+            st.warning("Save this recovery code now. It is shown only once and is "
+                       "the only way to reset a forgotten password.")
+            st.code(done["code"])
+            if st.button("I saved it - continue", use_container_width=True):
+                st.session_state["user"] = done["user"]
+                st.session_state.pop("signup_done")
+                st.rerun()
+            return
+
+        tab_in, tab_up, tab_reset = st.tabs(["🔑 Log in", "🆕 Sign up", "🛟 Forgot password"])
+
+        with tab_in:
+            with st.form("login_form"):
+                email = st.text_input("Email")
+                password = st.text_input("Password", type="password")
+                if st.form_submit_button("Log in", use_container_width=True):
+                    user, msg = login(email, password)
+                    if user:
+                        st.session_state["user"] = user
+                        st.rerun()
+                    st.error(msg)
+
+        with tab_up:
+            with st.form("signup_form"):
+                name = st.text_input("Your name")
+                email = st.text_input("Email", key="su_email")
+                password = st.text_input("Password", type="password", key="su_pw",
+                                         help="8+ characters with a letter and a number")
+                confirm = st.text_input("Confirm password", type="password", key="su_pw2")
+                if st.form_submit_button("Create account", use_container_width=True):
+                    if password != confirm:
+                        st.error("Passwords do not match.")
+                    else:
+                        user, result = register(email, name, password)
+                        if user:
+                            st.session_state["signup_done"] = {"user": user, "code": result}
+                            st.rerun()
+                        st.error(result)
+
+        with tab_reset:
+            st.caption("Use the recovery code you saved when you signed up.")
+            with st.form("reset_form"):
+                email = st.text_input("Email", key="rs_email")
+                code = st.text_input("Recovery code", placeholder="A1B2-C3D4-E5F6")
+                new_pw = st.text_input("New password", type="password", key="rs_pw")
+                if st.form_submit_button("Reset password", use_container_width=True):
+                    new_code, msg = reset_password(email, code, new_pw)
+                    if new_code:
+                        st.success("Password reset! Your NEW recovery code is below. "
+                                   "Save it, then log in.")
+                        st.code(new_code)
+                    else:
+                        st.error(msg)
+
+
+def require_login():
+    """Call at the top of the app. Shows the login screen and stops if logged out."""
+    if "user" not in st.session_state:
+        login_screen()
+        st.stop()
+    return st.session_state["user"]
+
+
+def logout():
+    st.session_state.clear()
+    st.rerun()
+
+
 # ---------------- DATABASE ----------------
 
 def run(query, params=(), fetch=False):
@@ -66,41 +373,65 @@ def initialize_db():
         notes TEXT DEFAULT '', completed_on TEXT)""")
     have = {r["name"] for r in run("PRAGMA table_info(tasks)", fetch=True)}
     for col, ddl in [("est_hours", "REAL DEFAULT 1"), ("notes", "TEXT DEFAULT ''"),
-                     ("completed_on", "TEXT")]:
+                     ("completed_on", "TEXT"), ("user_id", "INTEGER")]:
         if col not in have:
             run(f"ALTER TABLE tasks ADD COLUMN {col} {ddl}")
+    run("""CREATE TABLE IF NOT EXISTS study_logs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL,
+        subject TEXT NOT NULL, minutes INTEGER NOT NULL, day TEXT NOT NULL,
+        note TEXT DEFAULT '')""")
+    init_auth_tables()
 
 
 def add_task(title, subject, deadline, priority, hours, notes):
-    run("INSERT INTO tasks (title, subject, deadline, priority, est_hours, notes) "
-        "VALUES (?,?,?,?,?,?)",
-        (title, subject, deadline.isoformat(), priority, hours, notes))
+    run("INSERT INTO tasks (title, subject, deadline, priority, est_hours, notes, "
+        "user_id) VALUES (?,?,?,?,?,?,?)",
+        (title, subject, deadline.isoformat(), priority, hours, notes, UID))
 
 
 def update_task(tid, title, subject, deadline, priority, hours, notes):
     run("UPDATE tasks SET title=?, subject=?, deadline=?, priority=?, "
-        "est_hours=?, notes=? WHERE id=?",
-        (title, subject, deadline.isoformat(), priority, hours, notes, tid))
+        "est_hours=?, notes=? WHERE id=? AND user_id=?",
+        (title, subject, deadline.isoformat(), priority, hours, notes, tid, UID))
 
 
 def update_status(tid, done):
-    run("UPDATE tasks SET completed=?, completed_on=? WHERE id=?",
-        (int(done), date.today().isoformat() if done else None, tid))
+    run("UPDATE tasks SET completed=?, completed_on=? WHERE id=? AND user_id=?",
+        (int(done), date.today().isoformat() if done else None, tid, UID))
 
 
 def delete_task(tid):
-    run("DELETE FROM tasks WHERE id=?", (tid,))
+    run("DELETE FROM tasks WHERE id=? AND user_id=?", (tid, UID))
 
 
 def get_tasks():
     rows = run("SELECT id, title, subject, deadline, priority, completed, "
                "COALESCE(est_hours,1) AS est_hours, COALESCE(notes,'') AS notes, "
-               "completed_on FROM tasks ORDER BY deadline", fetch=True)
+               "completed_on FROM tasks WHERE user_id=? ORDER BY deadline", (UID,), fetch=True)
     df = pd.DataFrame(rows, columns=COLUMNS)
     df["deadline"] = pd.to_datetime(df["deadline"]).dt.date
     df["completed_on"] = pd.to_datetime(df["completed_on"], errors="coerce").dt.date
     df["completed"] = df["completed"].astype(bool)
     df["est_hours"] = df["est_hours"].astype(float)
+    return df
+
+
+def add_log(subject, minutes, day, note):
+    run("INSERT INTO study_logs (user_id, subject, minutes, day, note) VALUES (?,?,?,?,?)",
+        (UID, subject, minutes, day.isoformat(), note))
+
+
+def delete_log(lid):
+    run("DELETE FROM study_logs WHERE id=? AND user_id=?", (lid, UID))
+
+
+def get_logs():
+    rows = run("SELECT id, subject, minutes, day, COALESCE(note,'') AS note "
+               "FROM study_logs WHERE user_id=? ORDER BY day DESC, id DESC",
+               (UID,), fetch=True)
+    df = pd.DataFrame(rows, columns=["id", "subject", "minutes", "day", "note"])
+    df["day"] = pd.to_datetime(df["day"]).dt.date
+    df["minutes"] = df["minutes"].astype(int)
     return df
 
 
@@ -219,7 +550,12 @@ def style_chart(chart):
 # ---------------- LOAD DATA ----------------
 
 initialize_db()
+user = require_login()          # shows the login screen and stops if logged out
+UID = user["id"]
 tasks = get_tasks()
+logs = get_logs()
+goal_min = max(int(user["daily_goal"] * 60), 1)
+today_min = int(logs.loc[logs["day"] == today, "minutes"].sum())
 total = len(tasks)
 completed = int(tasks["completed"].sum())
 pending_count = total - completed
@@ -233,15 +569,20 @@ overdue_count = int((pending_df["deadline"] < today).sum()) if total else 0
 # ---------------- SIDEBAR ----------------
 
 st.sidebar.title("🎓 StudyMate")
-name = st.sidebar.text_input("Your name", value="Student", key="name")
-theme = st.sidebar.selectbox("🎨 Theme", list(THEMES))
-C1, C2, BG = THEMES[theme]
+name = user["name"]
+st.sidebar.caption(f"👤 {name}  ·  {user['email']}")
+C1, C2, BG = THEMES.get(user["theme"], THEMES["🌊 Ocean"])
 page = st.sidebar.radio("Navigation", [
-    "🏠 Dashboard", "📝 My Tasks", "🧠 Study Planner", "⏱️ Focus Timer", "📊 Analytics"])
+    "🏠 Dashboard", "📝 My Tasks", "📅 Calendar", "🧠 Study Planner",
+    "⏱️ Focus Timer", "🕒 Study Log", "📊 Analytics", "👤 Profile"])
 st.sidebar.divider()
 st.sidebar.write(f"🏅 **Level {level}**  ·  {xp} XP")
 st.sidebar.progress(xp_in_level / 100)
 st.sidebar.caption(f"🔥 {streak}-day streak")
+st.sidebar.write(f"🎯 Today: {today_min}/{goal_min} min")
+st.sidebar.progress(min(today_min / goal_min, 1.0))
+if st.sidebar.button("🚪 Log out", use_container_width=True):
+    logout()
 
 # ---------------- CUSTOM DESIGN ----------------
 
@@ -271,6 +612,15 @@ p, label, li { color: #334155 !important; }
 .chip, .chip * { color: white !important; }
 .quote { background: white; border-radius: 16px; padding: 16px 20px; margin: 10px 0;
          border: 2px dashed __C1__; font-style: italic; }
+.cal { width: 100%; border-collapse: separate; border-spacing: 6px; table-layout: fixed; }
+.cal th { background: linear-gradient(135deg, __C1__, __C2__); color: white; border-radius: 10px;
+          padding: 6px; font-size: 13px; }
+.cal td { background: white; border-radius: 10px; height: 96px; vertical-align: top;
+          padding: 5px; font-size: 12px; box-shadow: 0 2px 8px rgba(0,0,0,.06); }
+.cal td.today { outline: 3px solid __C2__; }
+.cal td.empty { background: transparent; box-shadow: none; }
+.ev { color: white; border-radius: 6px; padding: 1px 6px; margin-top: 3px; font-size: 11px;
+      overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
 .brk { text-align: center; color: #64748B !important; padding: 4px; font-size: 14px; }
 .heat { display: grid; grid-template-columns: repeat(7, 1fr); gap: 6px; max-width: 420px; }
 .heat div { border-radius: 6px; height: 34px; font-size: 11px; text-align: center; line-height: 34px; }
@@ -314,6 +664,11 @@ if page == "🏠 Dashboard":
              ("⚠️", "Overdue", overdue_count, "#EF4444", "#EC4899")]
     for col, c in zip(cols, cards):
         col.markdown(metric_card(*c), unsafe_allow_html=True)
+
+    goal_pct = min(today_min / goal_min, 1.0)
+    st.markdown(f'<div class="quote">🎯 Daily goal: <b>{today_min}</b> of {goal_min} minutes '
+                f'studied today ({int(goal_pct * 100)}%)</div>', unsafe_allow_html=True)
+    st.progress(goal_pct)
 
     st.markdown(f'<div class="quote">💡 {QUOTES[today.toordinal() % len(QUOTES)]}</div>',
                 unsafe_allow_html=True)
@@ -566,6 +921,170 @@ elif page == "⏱️ Focus Timer":
              .replace("__B__", str(int(break_min))))
     st.subheader(f"Now: {chosen}")
     components.html(timer, height=360)
+
+# ---------------- CALENDAR ----------------
+
+elif page == "📅 Calendar":
+    st.markdown(hero("📅 Deadline Calendar",
+                     "🔴 High · 🟠 Medium · 🟢 Low · ⚪ Done"), unsafe_allow_html=True)
+    st.session_state.setdefault("cal_offset", 0)
+    b1, b2, b3 = st.columns([1, 3, 1])
+    if b1.button("◀ Prev", use_container_width=True):
+        st.session_state["cal_offset"] -= 1
+        st.rerun()
+    if b3.button("Next ▶", use_container_width=True):
+        st.session_state["cal_offset"] += 1
+        st.rerun()
+    year, month0 = divmod(today.year * 12 + today.month - 1 + st.session_state["cal_offset"], 12)
+    month = month0 + 1
+    b2.markdown(f"<h3 style='text-align:center'>{calendar.month_name[month]} {year}</h3>",
+                unsafe_allow_html=True)
+
+    by_day = {}
+    for _, t in tasks.iterrows():
+        by_day.setdefault(t["deadline"], []).append(t)
+
+    rows = "<tr>" + "".join(f"<th>{d}</th>" for d in
+                            ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]) + "</tr>"
+    for week in calendar.Calendar(firstweekday=0).monthdayscalendar(year, month):
+        rows += "<tr>"
+        for d in week:
+            if d == 0:
+                rows += '<td class="empty"></td>'
+                continue
+            day = date(year, month, d)
+            items = ""
+            todays = by_day.get(day, [])
+            for t in todays[:3]:
+                col = "#94A3B8" if t["completed"] else PRIORITY_COLOR[t["priority"]]
+                items += f'<div class="ev" style="background:{col}">{esc(t["title"])}</div>'
+            if len(todays) > 3:
+                items += f'<div style="font-size:11px;color:#64748B">+{len(todays) - 3} more</div>'
+            cls = "today" if day == today else ""
+            rows += f'<td class="{cls}"><b>{d}</b>{items}</td>'
+        rows += "</tr>"
+    st.markdown(f'<table class="cal">{rows}</table>', unsafe_allow_html=True)
+
+# ---------------- STUDY LOG ----------------
+
+elif page == "🕒 Study Log":
+    st.markdown(hero("🕒 Study Log", "Log your study time and hit your daily goal."),
+                unsafe_allow_html=True)
+    show_flash()
+    st.progress(min(today_min / goal_min, 1.0))
+    st.caption(f"Today: {today_min} / {goal_min} min")
+
+    known = sorted(tasks["subject"].unique())
+    with st.form("log_form", clear_on_submit=True):
+        a, b, c = st.columns(3)
+        subj = a.text_input("Subject", placeholder=", ".join(known[:3]) or "e.g. Maths")
+        mins = b.number_input("Minutes", 5, 480, 30, 5)
+        when = c.date_input("Date", today, max_value=today)
+        note = st.text_input("What did you study? (optional)")
+        if st.form_submit_button("➕ Log session", use_container_width=True):
+            if subj.strip():
+                add_log(subj.strip(), int(mins), when, note.strip())
+                reached = when == today and today_min < goal_min <= today_min + mins
+                flash("🎯 Daily goal reached! Amazing!" if reached
+                      else f"Logged {int(mins)} min of {subj.strip()} 📚", reached)
+                st.rerun()
+            else:
+                st.error("Please enter a subject.")
+
+    days7 = [today - timedelta(days=i) for i in range(6, -1, -1)]
+    per_day = logs.groupby("day")["minutes"].sum().to_dict()
+    wk = pd.DataFrame({"Day": [d.strftime("%a %d") for d in days7],
+                       "Minutes": [int(per_day.get(d, 0)) for d in days7]})
+    met = sum(1 for d in days7 if per_day.get(d, 0) >= goal_min)
+    cols = st.columns(3)
+    for col, c in zip(cols, [("📚", "This week", f"{wk['Minutes'].sum()} min", "#6366F1", "#8B5CF6"),
+                             ("📈", "Daily average", f"{int(wk['Minutes'].mean())} min", "#0EA5E9", "#14B8A6"),
+                             ("🎯", "Goal days", f"{met}/7", "#F59E0B", "#F97316")]):
+        col.markdown(metric_card(*c), unsafe_allow_html=True)
+
+    st.subheader("📊 Last 7 Days vs Goal")
+    bars = alt.Chart(wk).mark_bar(cornerRadiusTopLeft=8, cornerRadiusTopRight=8, color=C1).encode(
+        x=alt.X("Day:N", sort=None, title=None, axis=alt.Axis(labelAngle=0)),
+        y=alt.Y("Minutes:Q"), tooltip=["Day", "Minutes"])
+    goal_line = alt.Chart(pd.DataFrame({"goal": [goal_min]})).mark_rule(
+        color="#EF4444", strokeDash=[6, 4], size=2).encode(y="goal:Q")
+    st.altair_chart(style_chart(bars + goal_line), use_container_width=True)
+
+    if not logs.empty:
+        st.subheader("📚 Time by Subject")
+        bs = logs.groupby("subject")["minutes"].sum().reset_index()
+        st.altair_chart(style_chart(alt.Chart(bs).mark_bar(
+            cornerRadiusTopRight=8, cornerRadiusBottomRight=8).encode(
+            y=alt.Y("subject:N", title=None, sort="-x"), x=alt.X("minutes:Q", title="Minutes"),
+            color=alt.Color("subject:N", legend=None, scale=alt.Scale(
+                domain=list(bs["subject"]),
+                range=[subject_color(s) for s in bs["subject"]])))),
+            use_container_width=True)
+
+        st.subheader("🗂️ Recent Sessions")
+        for _, r in logs.head(15).iterrows():
+            lid = int(r["id"])
+            l, rr = st.columns([6, 1])
+            extra = f" - {esc(r['note'])}" if r["note"] else ""
+            l.markdown(f"**{r['day']}** · {chip(r['subject'], subject_color(r['subject']))} "
+                       f"{int(r['minutes'])} min{extra}", unsafe_allow_html=True)
+            if rr.button("🗑️", key=f"dlog_{lid}"):
+                delete_log(lid)
+                st.rerun()
+
+# ---------------- PROFILE ----------------
+
+elif page == "👤 Profile":
+    st.markdown(hero("👤 My Profile", esc(user["email"])), unsafe_allow_html=True)
+    show_flash()
+    left, right = st.columns(2)
+
+    with left:
+        st.subheader("🎨 Preferences")
+        with st.form("profile_form"):
+            p_name = st.text_input("Display name", user["name"])
+            p_goal = st.number_input("Daily study goal (hours)", 0.5, 12.0,
+                                     float(user["daily_goal"]), 0.5)
+            themes = list(THEMES)
+            p_theme = st.selectbox("Theme", themes, index=themes.index(user["theme"])
+                                   if user["theme"] in themes else 0)
+            if st.form_submit_button("Save profile", use_container_width=True):
+                if p_name.strip():
+                    update_profile(UID, p_name.strip(), p_goal, p_theme)
+                    st.session_state["user"] = get_user(UID)
+                    flash("Profile saved ✨")
+                    st.rerun()
+                else:
+                    st.error("Name can't be empty.")
+
+    with right:
+        st.subheader("🔒 Change Password")
+        with st.form("pw_form", clear_on_submit=True):
+            cur = st.text_input("Current password", type="password")
+            new1 = st.text_input("New password", type="password")
+            new2 = st.text_input("Confirm new password", type="password")
+            if st.form_submit_button("Update password", use_container_width=True):
+                if new1 != new2:
+                    st.error("New passwords do not match.")
+                else:
+                    ok, msg = change_password(UID, cur, new1)
+                    if ok:
+                        flash(msg)
+                        st.rerun()
+                    st.error(msg)
+
+    with st.expander("⚠️ Danger zone"):
+        with st.form("delete_form"):
+            pw = st.text_input("Confirm your password", type="password")
+            sure = st.checkbox("I understand this permanently deletes all my data")
+            if st.form_submit_button("Delete my account"):
+                if not sure:
+                    st.error("Please tick the confirmation box.")
+                else:
+                    ok, msg = delete_account(UID, pw)
+                    if ok:
+                        logout()
+                    st.error(msg)
 
 # ---------------- ANALYTICS ----------------
 
